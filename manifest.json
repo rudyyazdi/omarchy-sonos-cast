@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "user.sonos-cast",
+  "name": "Sonos Cast",
+  "version": "1.0.0",
+  "author": "rudy",
+  "description": "Send this machine's audio to a Sonos speaker and control its volume",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "SonosCast.qml" },
+  "barWidget": {
+    "displayName": "Sonos Cast",
+    "description": "Toggle audio casting to Sonos and set speaker volume",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

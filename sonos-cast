@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""sonos-cast: route this machine's audio to a Sonos speaker over the LAN.
+
+Lowest-latency path available for a Play:1 (no line-in/AirPlay/Bluetooth):
+PipeWire null sink -> parec -> raw 16-bit PCM WAV over HTTP -> Sonos.
+
+Subcommands:
+  on | off | toggle          start/stop casting (moves default sink + streams)
+  status [--json]            casting state, Sonos transport state, volume, mute
+  volume <N|+N|-N>           set Sonos volume (0-100) or step it
+  mute-toggle                toggle Sonos mute
+  key <raise|lower|mute-toggle|+N|-N>
+                             volume-key shim: Sonos when casting, else local
+  serve                      (internal) HTTP stream server + watchdog
+"""
+import json, os, re, signal, socket, struct, subprocess, sys, threading, time, urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+CONF = os.path.expanduser("~/.config/omarchy/plugins/user.sonos-cast/config.env")
+RUN = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "sonos-cast")
+os.makedirs(RUN, exist_ok=True)
+PIDFILE, STATEFILE = os.path.join(RUN, "server.pid"), os.path.join(RUN, "state.json")
+CONNFILE = os.path.join(RUN, "connected")
+SINK = "sonos_cast"
+RATE, CH, BITS = 44100, 2, 16
+
+cfg = {"SONOS_HOST": "192.168.20.5", "PORT": "8765", "STEP": "5", "LATENCY_MS": "30"}
+if os.path.exists(CONF):
+    for line in open(CONF):
+        m = re.match(r"^\s*([A-Z_]+)\s*=\s*\"?([^\"#]*)\"?", line)
+        if m: cfg[m.group(1)] = m.group(2).strip()
+HOST, PORT, STEP, LAT = cfg["SONOS_HOST"], int(cfg["PORT"]), int(cfg["STEP"]), int(cfg["LATENCY_MS"])
+
+# ---------- Sonos SOAP ----------
+def soap(path, service, action, body="", timeout=3):
+    env = ('<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+           's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
+           f'<u:{action} xmlns:u="urn:schemas-upnp-org:service:{service}:1"><InstanceID>0</InstanceID>{body}</u:{action}>'
+           '</s:Body></s:Envelope>').encode()
+    req = urllib.request.Request(f"http://{HOST}:1400/{path}", data=env, method="POST", headers={
+        "Content-Type": 'text/xml; charset="utf-8"',
+        "SOAPACTION": f'"urn:schemas-upnp-org:service:{service}:1#{action}"'})
+    return urllib.request.urlopen(req, timeout=timeout).read().decode(errors="ignore")
+
+def rc(action, body=""): return soap("MediaRenderer/RenderingControl/Control", "RenderingControl", action, "<Channel>Master</Channel>" + body)
+def av(action, body=""): return soap("MediaRenderer/AVTransport/Control", "AVTransport", action, body)
+def tag(xml, name):
+    m = re.search(f"<{name}>([^<]*)</{name}>", xml); return m.group(1) if m else ""
+
+def sonos_volume(): return int(tag(rc("GetVolume"), "CurrentVolume") or 0)
+def sonos_muted(): return tag(rc("GetMute"), "CurrentMute") == "1"
+def sonos_set_volume(v): rc("SetVolume", f"<DesiredVolume>{max(0, min(100, int(v)))}</DesiredVolume>")
+def sonos_set_mute(m): rc("SetMute", f"<DesiredMute>{1 if m else 0}</DesiredMute>")
+def sonos_state():
+    try: return tag(av("GetTransportInfo"), "CurrentTransportState")
+    except Exception: return "UNREACHABLE"
+def sonos_room():
+    try:
+        x = urllib.request.urlopen(f"http://{HOST}:1400/status/zp", timeout=2).read().decode(errors="ignore")
+        return tag(x, "ZoneName") or HOST
+    except Exception: return HOST
+
+def local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect((HOST, 1400)); ip = s.getsockname()[0]; s.close(); return ip
+
+def stream_url(): return f"http://{local_ip()}:{PORT}/stream.wav"
+
+def sonos_play_stream():
+    url = stream_url()
+    meta = ('&lt;DIDL-Lite xmlns:dc=&quot;http://purl.org/dc/elements/1.1/&quot; xmlns:upnp=&quot;urn:schemas-upnp-org:metadata-1-0/upnp/&quot; '
+            'xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/&quot;&gt;&lt;item id=&quot;sonos-cast&quot; parentID=&quot;0&quot; restricted=&quot;1&quot;&gt;'
+            f'&lt;dc:title&gt;{socket.gethostname()} audio&lt;/dc:title&gt;&lt;upnp:class&gt;object.item.audioItem.musicTrack&lt;/upnp:class&gt;'
+            '&lt;/item&gt;&lt;/DIDL-Lite&gt;')
+    soap("MediaRenderer/AVTransport/Control", "AVTransport", "SetAVTransportURI", f"<CurrentURI>{url}</CurrentURI><CurrentURIMetaData>{meta}</CurrentURIMetaData>", timeout=20)
+    soap("MediaRenderer/AVTransport/Control", "AVTransport", "Play", "<Speed>1</Speed>", timeout=20)
+
+# ---------- PipeWire / pactl ----------
+def sh(*a, check=False):
+    return subprocess.run(a, capture_output=True, text=True, check=check).stdout.strip()
+
+def read_state():
+    try: return json.load(open(STATEFILE))
+    except Exception: return {}
+def write_state(d): json.dump(d, open(STATEFILE, "w"))
+
+def server_alive():
+    try:
+        pid = int(open(PIDFILE).read()); os.kill(pid, 0); return pid
+    except Exception: return 0
+
+def casting(): return bool(read_state().get("casting")) and server_alive() > 0
+
+def cmd_on():
+    if casting():
+        sonos_play_stream(); return
+    prev = sh("pactl", "get-default-sink")
+    if SINK not in sh("pactl", "list", "short", "sinks"):
+        mod = sh("pactl", "load-module", "module-null-sink", f"sink_name={SINK}",
+                 f"rate={RATE}", f"channels={CH}", "format=s16le",
+                 "sink_properties=device.description=Sonos\\ Cast")
+    else:
+        mod = read_state().get("module", "")
+    sh("pactl", "set-default-sink", SINK)
+    for line in sh("pactl", "list", "short", "sink-inputs").splitlines():
+        sh("pactl", "move-sink-input", line.split()[0], SINK)
+    write_state({"casting": True, "prev_sink": prev, "module": mod})
+    if not server_alive():
+        p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "serve"], start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=open(os.path.join(RUN, "server.log"), "a"), stderr=subprocess.STDOUT)
+        open(PIDFILE, "w").write(str(p.pid))
+        time.sleep(0.3)
+    try: os.remove(CONNFILE)
+    except Exception: pass
+    sonos_play_stream()
+    for _ in range(40):
+        if os.path.exists(CONNFILE): break
+        time.sleep(0.2)
+    if os.path.exists(CONNFILE):
+        osd("Casting to " + sonos_room())
+    else:
+        osd(f"Sonos cannot reach port {PORT} - check firewall")
+        print(f"Speaker never connected to {stream_url()}. If ufw is active run:\n"
+              f"  sudo ufw allow from {HOST} to any port {PORT} proto tcp comment 'sonos-cast'", file=sys.stderr)
+
+def cmd_off(stop_speaker=True, reason="Casting stopped"):
+    st = read_state()
+    pid = server_alive()
+    if stop_speaker:
+        try: av("Stop")
+        except Exception: pass
+    prev = st.get("prev_sink")
+    if prev and prev != SINK:
+        sh("pactl", "set-default-sink", prev)
+        for line in sh("pactl", "list", "short", "sink-inputs").splitlines():
+            sh("pactl", "move-sink-input", line.split()[0], prev)
+    mod = st.get("module")
+    if mod: sh("pactl", "unload-module", mod)
+    else:
+        for line in sh("pactl", "list", "short", "modules").splitlines():
+            if f"sink_name={SINK}" in line: sh("pactl", "unload-module", line.split()[0])
+    for f in (PIDFILE, STATEFILE, CONNFILE):
+        try: os.remove(f)
+        except Exception: pass
+    osd(reason)
+    if pid:
+        try: os.killpg(pid, signal.SIGTERM)
+        except Exception: pass
+
+def osd(text=None, icon=None, percent=None):
+    args = ["omarchy-osd"]
+    if icon: args += ["-i", icon]
+    if percent is not None: args += ["-p", str(percent)]
+    if text: args += ["-m", text]
+    subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def cmd_status(as_json):
+    c = casting()
+    d = {"casting": c, "host": HOST, "room": sonos_room(), "state": sonos_state()}
+    try: d["volume"], d["muted"] = sonos_volume(), sonos_muted()
+    except Exception: d["volume"], d["muted"] = None, None
+    if c:
+        d["url"] = stream_url(); d["connected"] = os.path.exists(CONNFILE)
+    if as_json: print(json.dumps(d))
+    else:
+        print(f"{'CASTING' if c else 'off'}  {d['room']} ({HOST})  {d['state']}  vol={d['volume']} muted={d['muted']}" + (f"\n{d['url']}" if c else ""))
+
+def cmd_volume(arg):
+    if re.match(r"^[+-]\d+$", arg): v = sonos_volume() + int(arg)
+    else: v = int(arg)
+    v = max(0, min(100, v)); sonos_set_mute(False); sonos_set_volume(v)
+    print(v); return v
+
+def cmd_key(action):
+    if not casting():
+        os.execvp("omarchy-audio-output-volume", ["omarchy-audio-output-volume", action])
+    if action == "raise": action = f"+{STEP}"
+    if action == "lower": action = f"-{STEP}"
+    if action == "mute-toggle":
+        m = not sonos_muted(); sonos_set_mute(m); v = sonos_volume()
+        osd(icon="volume-muted" if m or v == 0 else "volume-high", percent=v); return
+    v = cmd_volume(action)
+    osd(icon="volume-muted" if v == 0 else "volume-high", percent=v)
+
+# ---------- stream server ----------
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"
+    def log_message(self, *a): pass
+    def _head(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(0x7FFFFFFF))
+        self.send_header("Accept-Ranges", "none")
+        self.send_header("Cache-Control", "no-cache, no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+    def do_HEAD(self): self._head()
+    def do_GET(self):
+        if not self.path.startswith("/stream"):
+            self.send_error(404); return
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        open(CONNFILE, "w").write(str(time.time()))
+        self._head()
+        block = CH * BITS // 8
+        hdr = b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, CH, RATE, RATE * block, block, BITS) + b"data" + struct.pack("<I", 0xFFFFFFFF)
+        self.wfile.write(hdr); self.wfile.flush()
+        rec = subprocess.Popen(["parec", f"--device={SINK}.monitor", "--format=s16le", f"--rate={RATE}", f"--channels={CH}",
+                                f"--latency-msec={LAT}", "--process-time-msec=10", "--raw"], stdout=subprocess.PIPE)
+        try:
+            while True:
+                data = os.read(rec.stdout.fileno(), 4096)
+                if not data: break
+                self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            rec.terminate()
+
+def current_uri():
+    try: return tag(av("GetMediaInfo"), "CurrentURI")
+    except Exception: return None
+
+def watchdog():
+    while True:
+        time.sleep(3)
+        st = read_state()
+        if not st.get("casting"): continue
+        uri = current_uri()
+        if uri is None: continue
+        if uri and "/stream.wav" not in uri:
+            # Someone else took the speaker (Spotify, the Sonos app...): give
+            # the laptop its audio back and leave the speaker alone.
+            cmd_off(stop_speaker=False, reason=sonos_room() + " taken over, cast off")
+            return
+        if sonos_state() == "STOPPED":
+            try: sonos_play_stream()
+            except Exception: pass
+
+def cmd_serve():
+    signal.signal(signal.SIGTERM, lambda *a: os._exit(0))
+    threading.Thread(target=watchdog, daemon=True).start()
+    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler); srv.daemon_threads = True
+    srv.serve_forever()
+
+if __name__ == "__main__":
+    a = sys.argv[1:] or ["status"]
+    try:
+        if a[0] == "on": cmd_on()
+        elif a[0] == "off": cmd_off()
+        elif a[0] == "toggle": cmd_off() if casting() else cmd_on()
+        elif a[0] == "status": cmd_status("--json" in a)
+        elif a[0] == "volume": cmd_volume(a[1])
+        elif a[0] == "mute-toggle": sonos_set_mute(not sonos_muted()); print("muted" if sonos_muted() else "unmuted")
+        elif a[0] == "key": cmd_key(a[1])
+        elif a[0] == "serve": cmd_serve()
+        else: print(__doc__); sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"Sonos at {HOST} unreachable: {e}", file=sys.stderr); sys.exit(2)
