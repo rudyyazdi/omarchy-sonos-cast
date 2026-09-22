@@ -13,6 +13,7 @@ Panel {
 
   property bool casting: false
   property bool connected: false
+  property bool buffered: false
   property string room: "Sonos"
   property string transportState: ""
   property int volume: 0
@@ -53,6 +54,7 @@ Panel {
           var d = JSON.parse(text)
           root.casting = !!d.casting
           root.connected = !!d.connected
+          root.buffered = !!d.buffered
           root.room = d.room || root.room
           root.transportState = d.state || ""
           root.reachable = d.state !== "UNREACHABLE"
@@ -140,6 +142,16 @@ Panel {
       }
 
       PanelSeparator { width: parent.width }
+
+      Toggle {
+        width: parent.width
+        label: "Buffer audio"
+        description: "Smooths skipping; adds about 1 s of delay. Switching briefly reconnects casting."
+        checked: root.buffered
+        enabled: !root.busy
+        foreground: root.barForeground
+        onClicked: root.run(["buffer-toggle"], "Switching buffer…")
+      }
 
       Column {
         width: parent.width

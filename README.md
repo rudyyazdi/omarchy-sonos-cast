@@ -13,6 +13,7 @@ No encoding step, so the only delay is the speaker's own HTTP buffer
 - Bar icon (**S**): left click opens the panel, middle click toggles casting,
   scroll adjusts speaker volume while casting
 - Panel: cast on/off, speaker volume slider, mute
+- Optional **Buffer audio** toggle: enable when casting skips, disable for video
 - Volume keys drive the speaker while casting and fall back to local audio otherwise
 - Auto hand-back: if something else takes over the speaker (Spotify from a phone,
   the Sonos app), casting turns itself off and your local output is restored
@@ -52,6 +53,7 @@ ln -sf ~/.config/omarchy/plugins/user.sonos-cast/sonos-cast ~/.local/bin/sonos-c
 ```
 sonos-cast on | off | toggle
 sonos-cast status [--json]
+sonos-cast buffer-toggle
 sonos-cast volume <N|+N|-N>
 sonos-cast mute-toggle
 sonos-cast key <raise|lower|mute-toggle|+N|-N>   # volume-key shim
@@ -67,6 +69,13 @@ sonos-cast key <raise|lower|mute-toggle|+N|-N>   # volume-key shim
 | `manifest.json` | Omarchy plugin manifest                            |
 
 Runtime state and `server.log` live in `$XDG_RUNTIME_DIR/sonos-cast/`.
+
+**Buffer audio** defaults to off. Enabling it collects one second of audio
+before streaming and raises capture latency to at least 200 ms, giving playback
+more headroom at the cost of extra delay. Switching while casting briefly
+reconnects the stream; switching off clears the speaker's queued audio and
+restores the original capture latency. The choice survives casting off/on in
+the current login session and resets when the runtime directory is cleared.
 
 ## Requirements
 
