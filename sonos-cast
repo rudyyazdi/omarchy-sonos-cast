@@ -7,13 +7,14 @@ PipeWire null sink -> parec -> raw 16-bit PCM WAV over HTTP -> Sonos.
 Subcommands:
   on | off | toggle          start/stop casting (moves default sink + streams)
   status [--json]            casting state, Sonos transport state, volume, mute
+  buffer-toggle             toggle extra buffering (briefly reconnects casting)
   volume <N|+N|-N>           set Sonos volume (0-100) or step it
   mute-toggle                toggle Sonos mute
   key <raise|lower|mute-toggle|+N|-N>
                              volume-key shim: Sonos when casting, else local
   serve                      (internal) HTTP stream server + watchdog
 """
-import json, os, re, signal, socket, struct, subprocess, sys, threading, time, urllib.request
+import fcntl, json, os, re, signal, socket, struct, subprocess, sys, threading, time, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CONF = os.path.expanduser("~/.config/omarchy/plugins/user.sonos-cast/config.env")
@@ -21,6 +22,8 @@ RUN = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "sonos-cast")
 os.makedirs(RUN, exist_ok=True)
 PIDFILE, STATEFILE = os.path.join(RUN, "server.pid"), os.path.join(RUN, "state.json")
 CONNFILE = os.path.join(RUN, "connected")
+BUFFERFILE = os.path.join(RUN, "buffer.json")
+TRANSPORT_LOCK = os.path.join(RUN, "transport.lock")
 SINK = "sonos_cast"
 RATE, CH, BITS = 44100, 2, 16
 
@@ -82,6 +85,39 @@ def read_state():
     try: return json.load(open(STATEFILE))
     except Exception: return {}
 def write_state(d): json.dump(d, open(STATEFILE, "w"))
+
+def buffered():
+    try:
+        with open(BUFFERFILE) as f: return json.load(f).get("enabled") is True
+    except (OSError, ValueError, AttributeError): return False
+
+def set_buffered(enabled):
+    temporary = BUFFERFILE + f".{os.getpid()}.tmp"
+    try:
+        with open(temporary, "w") as f: json.dump({"enabled": enabled}, f)
+        os.replace(temporary, BUFFERFILE)
+    finally:
+        if os.path.exists(temporary): os.remove(temporary)
+
+def cmd_buffer_toggle():
+    with open(TRANSPORT_LOCK, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        _toggle_buffer()
+
+def _toggle_buffer():
+    previous = buffered()
+    set_buffered(not previous)
+    if casting():
+        try:
+            # Stop first to flush the speaker's old buffer, even for the same URI.
+            av("Stop")
+            sonos_play_stream()
+        except Exception:
+            set_buffered(previous)
+            try: sonos_play_stream()
+            except Exception: pass
+            raise
+    print("Buffer on" if not previous else "Buffer off")
 
 def server_alive():
     try:
@@ -155,14 +191,14 @@ def osd(text=None, icon=None, percent=None):
 
 def cmd_status(as_json):
     c = casting()
-    d = {"casting": c, "host": HOST, "room": sonos_room(), "state": sonos_state()}
+    d = {"casting": c, "host": HOST, "room": sonos_room(), "state": sonos_state(), "buffered": buffered()}
     try: d["volume"], d["muted"] = sonos_volume(), sonos_muted()
     except Exception: d["volume"], d["muted"] = None, None
     if c:
         d["url"] = stream_url(); d["connected"] = os.path.exists(CONNFILE)
     if as_json: print(json.dumps(d))
     else:
-        print(f"{'CASTING' if c else 'off'}  {d['room']} ({HOST})  {d['state']}  vol={d['volume']} muted={d['muted']}" + (f"\n{d['url']}" if c else ""))
+        print(f"{'CASTING' if c else 'off'}  {d['room']} ({HOST})  {d['state']}  vol={d['volume']} muted={d['muted']} buffer={'on' if d['buffered'] else 'off'}" + (f"\n{d['url']}" if c else ""))
 
 def cmd_volume(arg):
     if re.match(r"^[+-]\d+$", arg): v = sonos_volume() + int(arg)
@@ -203,9 +239,18 @@ class Handler(BaseHTTPRequestHandler):
         block = CH * BITS // 8
         hdr = b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, CH, RATE, RATE * block, block, BITS) + b"data" + struct.pack("<I", 0xFFFFFFFF)
         self.wfile.write(hdr); self.wfile.flush()
+        use_buffer = buffered()
+        latency = max(LAT, 200) if use_buffer else LAT
         rec = subprocess.Popen(["parec", f"--device={SINK}.monitor", "--format=s16le", f"--rate={RATE}", f"--channels={CH}",
-                                f"--latency-msec={LAT}", "--process-time-msec=10", "--raw"], stdout=subprocess.PIPE)
+                                f"--latency-msec={latency}", "--process-time-msec=10", "--raw"], stdout=subprocess.PIPE)
         try:
+            if use_buffer:
+                pending = bytearray()
+                while len(pending) < RATE * block:
+                    data = os.read(rec.stdout.fileno(), 4096)
+                    if not data: return
+                    pending.extend(data)
+                self.wfile.write(pending)
             while True:
                 data = os.read(rec.stdout.fileno(), 4096)
                 if not data: break
@@ -214,6 +259,10 @@ class Handler(BaseHTTPRequestHandler):
             pass
         finally:
             rec.terminate()
+            try: rec.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                rec.kill(); rec.wait()
+            rec.stdout.close()
 
 def current_uri():
     try: return tag(av("GetMediaInfo"), "CurrentURI")
@@ -222,18 +271,20 @@ def current_uri():
 def watchdog():
     while True:
         time.sleep(3)
-        st = read_state()
-        if not st.get("casting"): continue
-        uri = current_uri()
-        if uri is None: continue
-        if uri and "/stream.wav" not in uri:
-            # Someone else took the speaker (Spotify, the Sonos app...): give
-            # the laptop its audio back and leave the speaker alone.
-            cmd_off(stop_speaker=False, reason=sonos_room() + " taken over, cast off")
-            return
-        if sonos_state() == "STOPPED":
-            try: sonos_play_stream()
-            except Exception: pass
+        with open(TRANSPORT_LOCK, "a") as lock:
+            try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError: continue
+            st = read_state()
+            if not st.get("casting"): continue
+            uri = current_uri()
+            if uri is None: continue
+            if uri and "/stream.wav" not in uri:
+                # Someone else took the speaker: restore local audio.
+                cmd_off(stop_speaker=False, reason=sonos_room() + " taken over, cast off")
+                return
+            if sonos_state() == "STOPPED":
+                try: sonos_play_stream()
+                except Exception: pass
 
 def cmd_serve():
     signal.signal(signal.SIGTERM, lambda *a: os._exit(0))
@@ -248,6 +299,7 @@ if __name__ == "__main__":
         elif a[0] == "off": cmd_off()
         elif a[0] == "toggle": cmd_off() if casting() else cmd_on()
         elif a[0] == "status": cmd_status("--json" in a)
+        elif a[0] == "buffer-toggle": cmd_buffer_toggle()
         elif a[0] == "volume": cmd_volume(a[1])
         elif a[0] == "mute-toggle": sonos_set_mute(not sonos_muted()); print("muted" if sonos_muted() else "unmuted")
         elif a[0] == "key": cmd_key(a[1])
